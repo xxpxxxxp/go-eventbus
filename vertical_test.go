@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,11 +53,11 @@ func (v *testAsyncVertical) Interests() []reflect.Type {
 	return []reflect.Type{}
 }
 
-func (v *testAsyncVertical) OnAttached() {
+func (v *testAsyncVertical) OnAttached(bus EventBus) {
 	v.attached = true
 }
 
-func (v *testAsyncVertical) OnDetached() {
+func (v *testAsyncVertical) OnDetached(bus EventBus) {
 	v.detached = true
 }
 
@@ -69,14 +70,17 @@ func TestAsyncVertical(t *testing.T) {
 	bus := &fakedEventBus{list.New(), list.New()}
 	inner := &testAsyncVertical{false, false, list.New()}
 
+	ctx, cancelFunc := context.WithCancel(context.Background())
 	v := &vertical{
 		AsyncVerticalInterface: inner,
 		interests:              inner.Interests(),
+		ctx:                    ctx,
+		cancelFunc:             cancelFunc,
+		exitGroup:              &sync.WaitGroup{},
 		eventQueue:             lfreequeue.NewQueue(),
-		eventNotifyChan:        make(chan struct{}),
+		eventNotifyChan:        make(chan struct{}, 1),
 		eventBus:               bus,
 	}
-	v.ctx, v.cancelFunc = context.WithCancel(context.Background())
 
 	go v.loop()
 
@@ -132,11 +136,11 @@ func (v *testSyncVertical) Interests() []reflect.Type {
 	return []reflect.Type{}
 }
 
-func (v *testSyncVertical) OnAttached() {
+func (v *testSyncVertical) OnAttached(bus EventBus) {
 	v.attached = true
 }
 
-func (v *testSyncVertical) OnDetached() {
+func (v *testSyncVertical) OnDetached(bus EventBus) {
 	v.detached = true
 }
 
@@ -149,14 +153,17 @@ func TestSyncVertical(t *testing.T) {
 	bus := &fakedEventBus{list.New(), list.New()}
 	inner := &testSyncVertical{false, false, list.New()}
 
+	ctx, cancelFunc := context.WithCancel(context.Background())
 	v := &vertical{
 		AsyncVerticalInterface: &syncVerticalWrapper{inner},
 		interests:              inner.Interests(),
+		ctx:                    ctx,
+		cancelFunc:             cancelFunc,
+		exitGroup:              &sync.WaitGroup{},
 		eventQueue:             lfreequeue.NewQueue(),
-		eventNotifyChan:        make(chan struct{}),
+		eventNotifyChan:        make(chan struct{}, 1),
 		eventBus:               bus,
 	}
-	v.ctx, v.cancelFunc = context.WithCancel(context.Background())
 
 	go v.loop()
 

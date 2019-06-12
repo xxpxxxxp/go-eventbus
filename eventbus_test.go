@@ -5,6 +5,43 @@ import (
 	"testing"
 )
 
+// Unit Test =================================================
+type utVertical struct {
+}
+
+func (v *utVertical) Name() string {
+	return "UTVertical"
+}
+
+func (v *utVertical) Interests() []reflect.Type {
+	return []reflect.Type{IntType}
+}
+
+func (v *utVertical) OnAttached(bus EventBus) {
+}
+
+func (v *utVertical) OnDetached(bus EventBus) {
+}
+
+func (v *utVertical) Process(bus EventBus, event Event) (response interface{}, err error) {
+	return event.GetBody(), nil
+}
+
+func TestBasicUsage(t *testing.T) {
+	bus := NewEventBus(100, &DoNothingLogger{})
+	bus.AttachSyncVertical(&utVertical{})
+
+	if rst, err := bus.Request(0).GetResult(); err != nil {
+		t.Error("Incorrect dispatch")
+	} else {
+		if val, ok := rst.Front().Value.(*EventResponse); !ok || val.Response != 0 {
+			t.Error("Incorrect response")
+		}
+	}
+
+	bus.Shutdown()
+}
+
 // Benchmark =================================================
 type benchmarkVertical struct {
 }
@@ -17,10 +54,10 @@ func (v *benchmarkVertical) Interests() []reflect.Type {
 	return []reflect.Type{IntType}
 }
 
-func (v *benchmarkVertical) OnAttached() {
+func (v *benchmarkVertical) OnAttached(bus EventBus) {
 }
 
-func (v *benchmarkVertical) OnDetached() {
+func (v *benchmarkVertical) OnDetached(bus EventBus) {
 }
 
 func (v *benchmarkVertical) Process(bus EventBus, event Event) (response interface{}, err error) {

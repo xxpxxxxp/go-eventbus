@@ -30,11 +30,11 @@ func (f *failedFuture) GetResult() (*list.List, error) {
 	return nil, f.error
 }
 
-func newFuture(eventId uint64, timeout int64) *futureImpl {
+func newFuture(eventID uint64, timeout int64) *futureImpl {
 	return &futureImpl{
 		completed: atomic.NewBool(false),
 		result:    list.New(),
-		eventId:   eventId,
+		eventID:   eventID,
 		timeout:   timeout,
 		cond:      sync.NewCond(&sync.Mutex{}),
 	}
@@ -45,7 +45,7 @@ type futureImpl struct {
 	result    *list.List
 	err       error
 
-	eventId uint64
+	eventID uint64
 	timeout int64
 	cond    *sync.Cond
 }

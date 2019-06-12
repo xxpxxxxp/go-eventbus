@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	set "github.com/deckarep/golang-set"
@@ -47,9 +48,10 @@ func NewEventBus(responseTimeoutInMilliSec int64, logger Logger) EventBus {
 		logger:                    logger,
 		dispatch:                  make(map[reflect.Type]set.Set),
 		handle:                    make(map[VerticalHandle]*vertical),
+		verticalDetachGroup:       &sync.WaitGroup{},
 		ctx:                       ctx,
 		cancelFunc:                cancelFunc,
-		eventId:                   atomic.NewUint64(0),
+		eventID:                   atomic.NewUint64(0),
 		responseTimeoutInMilliSec: responseTimeoutInMilliSec,
 		eventQueue:                lfreequeue.NewQueue(),
 		eventNotifyChan:           make(chan struct{}, 1),
@@ -68,12 +70,13 @@ func NewEventBus(responseTimeoutInMilliSec int64, logger Logger) EventBus {
 type eventBusImpl struct {
 	logger Logger
 
-	dispatch map[reflect.Type]set.Set     // type <--> vertical handles
-	handle   map[VerticalHandle]*vertical // handle <--> vertical
+	dispatch            map[reflect.Type]set.Set     // type <--> vertical handles
+	handle              map[VerticalHandle]*vertical // handle <--> vertical
+	verticalDetachGroup *sync.WaitGroup
 
 	ctx                       context.Context
 	cancelFunc                context.CancelFunc
-	eventId                   *atomic.Uint64
+	eventID                   *atomic.Uint64
 	responseTimeoutInMilliSec int64
 	eventQueue                *lfreequeue.Queue
 	eventNotifyChan           chan struct{}
@@ -97,15 +100,14 @@ func (bus *eventBusImpl) AttachAsyncVertical(v AsyncVerticalInterface) VerticalH
 	if err == nil {
 		bus.logger.Infoln(fmt.Sprintf("vertical attached, hello %s", v.Name()))
 		return rst.Front().Value.(VerticalHandle)
-	} else {
-		if err == ErrorEventBusShutdown {
-			bus.logger.Infoln(fmt.Sprintf("EventBus is shutting down, vertical %s attachment discarded", v.Name()))
-		} else {
-			bus.logger.Errorln(fmt.Sprintf("vertical %s failed to attach with err %v", v.Name(), err))
-		}
-
-		return VerticalHandle(0)
 	}
+
+	if err == ErrorEventBusShutdown {
+		bus.logger.Infoln(fmt.Sprintf("EventBus is shutting down, vertical %s attachment discarded", v.Name()))
+	} else {
+		bus.logger.Errorln(fmt.Sprintf("vertical %s failed to attach with err %v", v.Name(), err))
+	}
+	return VerticalHandle(0)
 }
 
 func (bus *eventBusImpl) AttachSyncVertical(v SyncVerticalInterface) VerticalHandle {
@@ -133,9 +135,9 @@ func (bus *eventBusImpl) Request(ev interface{}) Future {
 	case <-bus.ctx.Done():
 		return &failedFuture{ErrorEventBusShutdown}
 	default:
-		eventId := bus.eventId.Add(1)
-		f := newFuture(eventId, bus.responseTimeoutInMilliSec+(time.Now().UnixNano()/int64(1e6)))
-		bus.eventQueue.Enqueue(&event{eventId, f, ev})
+		eventID := bus.eventID.Add(1)
+		f := newFuture(eventID, bus.responseTimeoutInMilliSec+(time.Now().UnixNano()/int64(1e6)))
+		bus.eventQueue.Enqueue(&event{eventID, f, ev})
 
 		select {
 		case bus.eventNotifyChan <- struct{}{}:
@@ -211,7 +213,7 @@ func (bus *eventBusImpl) attach(v AsyncVerticalInterface) VerticalHandle {
 	// take a unused handle
 	handle := func() VerticalHandle {
 		for {
-			h := VerticalHandle(generateId())
+			h := VerticalHandle(generateID())
 			if _, ok := bus.handle[h]; !ok {
 				return h
 			}
@@ -225,6 +227,7 @@ func (bus *eventBusImpl) attach(v AsyncVerticalInterface) VerticalHandle {
 		interests:              v.Interests(), // make sure the interests doesn't change after attach
 		ctx:                    ctx,
 		cancelFunc:             cancelFunc,
+		exitGroup:              bus.verticalDetachGroup,
 		eventQueue:             lfreequeue.NewQueue(),
 		eventNotifyChan:        make(chan struct{}, 1),
 		handle:                 handle,
@@ -258,11 +261,11 @@ func (bus *eventBusImpl) detach(handle VerticalHandle) (string, error) {
 		}
 
 		// release dependent futures
-		for eventId, handles := range bus.responseOwnerCheck {
+		for eventID, handles := range bus.responseOwnerCheck {
 			if handles.Contains(handle) {
-				bus.logger.Infoln(fmt.Sprintf("detaching vertical %s, abandon response to event %d", v.Name(), eventId))
+				bus.logger.Infoln(fmt.Sprintf("detaching vertical %s, abandon response to event %d", v.Name(), eventID))
 				handles.Remove(handle)
-				f := bus.reverseLookup[eventId].Value.(*futureImpl)
+				f := bus.reverseLookup[eventID].Value.(*futureImpl)
 				f.result.PushBack(&EventResponse{nil, ErrorVerticalDetached})
 
 				if handles.Cardinality() == 0 { // all responses collected
@@ -324,14 +327,14 @@ func (bus *eventBusImpl) dispatchEvent(ev *event) {
 }
 
 func (bus *eventBusImpl) completeFuture(f *futureImpl) {
-	bus.logger.Infoln(fmt.Sprintf("future %d fulfilled", f.eventId))
+	bus.logger.Infoln(fmt.Sprintf("future %d fulfilled", f.eventID))
 	f.SetComplete()
 
-	delete(bus.responseOwnerCheck, f.eventId)
+	delete(bus.responseOwnerCheck, f.eventID)
 	// as future is fulfilled, remove the correspond timeout from tracking list
-	if element, ok := bus.reverseLookup[f.eventId]; ok {
+	if element, ok := bus.reverseLookup[f.eventID]; ok {
 		bus.orderedTimeout.Remove(element)
-		delete(bus.reverseLookup, f.eventId)
+		delete(bus.reverseLookup, f.eventID)
 	}
 }
 
@@ -342,7 +345,7 @@ func (bus *eventBusImpl) timeoutFutures() {
 		if element := bus.orderedTimeout.Front(); element != nil && element.Value.(*futureImpl).timeout <= now {
 			// notice the future about timeout
 			f := element.Value.(*futureImpl)
-			bus.logger.Infoln(fmt.Sprintf("future of event %d timeout at %d", f.eventId, now))
+			bus.logger.Infoln(fmt.Sprintf("future of event %d timeout at %d", f.eventID, now))
 
 			f.err = ErrorResponseTimeout
 			bus.completeFuture(f)
@@ -353,12 +356,38 @@ func (bus *eventBusImpl) timeoutFutures() {
 }
 
 func (bus *eventBusImpl) cleanup() {
-	// unblock all futures
+	bus.logger.Infoln("EventBus exiting...")
+	// unblock all waiting futures
 	for _, element := range bus.reverseLookup {
 		future := element.Value.(*futureImpl)
 		future.err = ErrorEventBusShutdown
 		bus.completeFuture(future)
 	}
+
+	bus.logger.Infoln("waiting for verticals join")
+	exit := make(chan struct{})
+	// wait all verticals join
+	// in the meantime, we should still serving request: but this time, just return EventBus shutdown response
+	go func() {
+		for {
+			if ev, ok := bus.eventQueue.Dequeue(); ok {
+				// unblock incoming futures
+				f := ev.(*event).future
+				f.err = ErrorEventBusShutdown
+				f.SetComplete()
+			} else { // no event available now
+				select {
+				case <-bus.eventNotifyChan: // new event add to queue, continue
+				case <-exit: // all verticals joined
+					return
+				}
+			}
+		}
+	}()
+
+	bus.verticalDetachGroup.Wait()
+	exit <- struct{}{} // blocked until goroutine above exit
+	bus.logger.Infoln("all verticals joined, EventBus off")
 
 	// unhold all resources
 	bus.dispatch = nil

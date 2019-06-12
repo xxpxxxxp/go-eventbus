@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"runtime/debug"
+	"sync"
 
 	"github.com/scryner/lfreequeue"
 )
@@ -16,6 +17,7 @@ type vertical struct {
 	interests       []reflect.Type
 	ctx             context.Context
 	cancelFunc      context.CancelFunc
+	exitGroup       *sync.WaitGroup
 	eventQueue      *lfreequeue.Queue
 	eventNotifyChan chan struct{}
 
@@ -24,8 +26,11 @@ type vertical struct {
 }
 
 func (v *vertical) loop() {
-	v.OnAttached()
-	defer v.OnDetached()
+	v.exitGroup.Add(1)
+	defer v.exitGroup.Done()
+
+	v.OnAttached(v.eventBus)
+	defer v.OnDetached(v.eventBus)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -68,8 +73,8 @@ type abstractVerticalInterface interface {
 	// DO NOT change the return value after attached
 	Name() string
 	Interests() []reflect.Type
-	OnAttached()
-	OnDetached()
+	OnAttached(bus EventBus)
+	OnDetached(bus EventBus)
 }
 
 type AsyncVerticalInterface interface {
