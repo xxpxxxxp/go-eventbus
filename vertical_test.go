@@ -27,7 +27,7 @@ func (bus *fakedEventBus) AttachSyncVertical(v SyncVerticalInterface) VerticalHa
 func (bus *fakedEventBus) Detach(handle VerticalHandle) {
 }
 
-func (bus *fakedEventBus) Request(ev interface{}) Future {
+func (bus *fakedEventBus) Request(ev interface{}, timeoutInMillis int64) Future {
 	return &failedFuture{}
 }
 
@@ -61,7 +61,7 @@ func (v *testAsyncVertical) OnDetached(bus EventBus) {
 	v.detached = true
 }
 
-func (v *testAsyncVertical) Process(bus EventBusWithRespond, event Event) {
+func (v *testAsyncVertical) Process(ctx context.Context, bus EventBusWithRespond, event Event) {
 	v.events.PushBack(event)
 	bus.Respond(event, &EventResponse{event, nil})
 }
@@ -97,7 +97,7 @@ func TestAsyncVertical(t *testing.T) {
 		}
 	}
 
-	time.Sleep(time.Duration(1000) * time.Millisecond)
+	time.Sleep(time.Duration(10) * time.Millisecond)
 	// event / response should be in order
 	for i := 0; i < 10; i++ {
 		ev1 := inner.events.Front()
@@ -180,7 +180,7 @@ func TestSyncVertical(t *testing.T) {
 		}
 	}
 
-	time.Sleep(time.Duration(1000) * time.Millisecond)
+	time.Sleep(time.Duration(10) * time.Millisecond)
 	// event / response should be in order
 	for i := 0; i < 10; i++ {
 		ev1 := inner.events.Front()

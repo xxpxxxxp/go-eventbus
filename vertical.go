@@ -43,12 +43,10 @@ func (v *vertical) loop() {
 
 	for {
 		if ev, ok := v.eventQueue.Dequeue(); ok {
-			select {
-			case <-v.ctx.Done():
+			if v.ctx.Err() != nil {
 				return // EventBus is shutting down
-			default:
-				v.Process(v.eventBus, ev.(Event)) // process the event we got
 			}
+			v.Process(v.ctx, v.eventBus, ev.(Event)) // process the event we got
 		} else {
 			// no event available now
 			select {
@@ -83,13 +81,12 @@ type AsyncVerticalInterface interface {
 	//   that also means if you want to respond in the same goroutine, consider use the sync interface)
 	// failed to do so will result in EventBus bad performance (it will wait for resp timeout)
 	// DO NOT throw out panic!!! Eat your own shit!!!
-	Process(bus EventBusWithRespond, event Event)
+	Process(ctx context.Context, bus EventBusWithRespond, event Event)
 }
 
 type SyncVerticalInterface interface {
 	abstractVerticalInterface
 	// return response at the end of event handling
-	// you are NOT supposed to call respond method
 	// DO NOT throw out panic!!! Eat your own shit!!!
 	Process(bus EventBus, event Event) (response interface{}, err error)
 }
@@ -99,7 +96,7 @@ type syncVerticalWrapper struct {
 	SyncVerticalInterface
 }
 
-func (wrapper syncVerticalWrapper) Process(bus EventBusWithRespond, event Event) {
+func (wrapper syncVerticalWrapper) Process(ctx context.Context, bus EventBusWithRespond, event Event) {
 	resp, err := wrapper.SyncVerticalInterface.Process(bus, event)
 	bus.Respond(event, &EventResponse{resp, err})
 }

@@ -13,7 +13,7 @@ func TestFutureImpl(t *testing.T) {
 		time.Sleep(time.Duration(100) * time.Millisecond)
 		future.result.PushBack("testing")
 		future.err = nil
-		future.SetComplete()
+		future.setComplete()
 	}()
 
 	if future.IsCompleted() {

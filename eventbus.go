@@ -1,15 +1,14 @@
 package eventbus
 
 import (
-	"container/list"
 	"context"
 	"errors"
-	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
 	set "github.com/deckarep/golang-set"
+	rbt "github.com/emirpasic/gods/trees/redblacktree"
 	"github.com/scryner/lfreequeue"
 	"github.com/uber-go/atomic"
 )
@@ -22,7 +21,7 @@ type EventBus interface {
 	AttachAsyncVertical(v AsyncVerticalInterface) VerticalHandle
 	AttachSyncVertical(v SyncVerticalInterface) VerticalHandle
 	Detach(handle VerticalHandle)
-	Request(ev interface{}) Future
+	Request(ev interface{}, timeoutInMillis int64) Future // any timeout <= 0 will use default
 	Shutdown()
 }
 
@@ -33,6 +32,7 @@ type EventBusWithRespond interface {
 }
 
 var (
+	PlaceHolder             = struct{}{}
 	ErrorEventNotInterested = errors.New("event not interested")
 	ErrorEventBusShutdown   = errors.New("EventBus is shutting down")
 	ErrorResponseTimeout    = errors.New("response timeout")
@@ -55,13 +55,12 @@ func NewEventBus(responseTimeoutInMilliSec int64, logger Logger) EventBus {
 		responseTimeoutInMilliSec: responseTimeoutInMilliSec,
 		eventQueue:                lfreequeue.NewQueue(),
 		eventNotifyChan:           make(chan struct{}, 1),
-		responseOwnerCheck:        make(map[uint64]set.Set),
-		orderedTimeout:            list.New(),
-		reverseLookup:             make(map[uint64]*list.Element),
+		orderedTimeout:            rbt.NewWith(func(f1, f2 interface{}) int { return int(f1.(*futureImpl).timeout - f2.(*futureImpl).timeout) }),
+		futureMap:                 make(map[uint64]*futureImpl),
 	}
 
 	go bus.loop()
-	logger.Infoln(fmt.Sprintf("EventBus up & running, response timeout: %d ms", responseTimeoutInMilliSec))
+	logger.Infof("EventBus up & running, response timeout: %d ms", responseTimeoutInMilliSec)
 
 	return bus
 }
@@ -85,9 +84,8 @@ type eventBusImpl struct {
 	   The future that received all responses is completed
 	   Or if it's not completed after timeout, it's timeout
 	*/
-	responseOwnerCheck map[uint64]set.Set       // id <--> dispatching verticals
-	orderedTimeout     *list.List               // future's timeout ordered asc
-	reverseLookup      map[uint64]*list.Element // id <--> future element in orderedTimeout mapping
+	orderedTimeout *rbt.Tree              // futures ordered by timeout in red-black tree
+	futureMap      map[uint64]*futureImpl // id <--> future
 }
 
 // type alias so that user are allowed to reuse those public type as event
@@ -95,17 +93,17 @@ type verticalAttachEvent AsyncVerticalInterface
 type verticalDetachEvent VerticalHandle
 
 func (bus *eventBusImpl) AttachAsyncVertical(v AsyncVerticalInterface) VerticalHandle {
-	rst, err := bus.Request(verticalAttachEvent(v)).GetResult()
+	rst, err := bus.Request(verticalAttachEvent(v), -1).GetResult()
 
 	if err == nil {
-		bus.logger.Infoln(fmt.Sprintf("vertical attached, hello %s", v.Name()))
+		bus.logger.Infof("vertical attached, hello %s", v.Name())
 		return rst.Front().Value.(VerticalHandle)
 	}
 
 	if err == ErrorEventBusShutdown {
-		bus.logger.Infoln(fmt.Sprintf("EventBus is shutting down, vertical %s attachment discarded", v.Name()))
+		bus.logger.Infof("EventBus is shutting down, vertical %s attachment discarded", v.Name())
 	} else {
-		bus.logger.Errorln(fmt.Sprintf("vertical %s failed to attach with err %v", v.Name(), err))
+		bus.logger.Errorf("vertical %s failed to attach with err %v", v.Name(), err)
 	}
 	return VerticalHandle(0)
 }
@@ -115,42 +113,46 @@ func (bus *eventBusImpl) AttachSyncVertical(v SyncVerticalInterface) VerticalHan
 }
 
 func (bus *eventBusImpl) Detach(handle VerticalHandle) {
-	rst, err := bus.Request(verticalDetachEvent(handle)).GetResult()
+	rst, err := bus.Request(verticalDetachEvent(handle), -1).GetResult()
 
 	if err == nil {
-		bus.logger.Infoln(fmt.Sprintf("vertical detached, bye-bye %s", rst.Front().Value.(string)))
+		bus.logger.Infof("vertical detached, bye-bye %s", rst.Front().Value.(string))
 	} else {
 		if err == ErrorEventBusShutdown {
-			bus.logger.Infoln(fmt.Sprintf("EventBus is shutting down, vertical %d detachment discarded", handle))
+			bus.logger.Infof("EventBus is shutting down, vertical %d detachment discarded", handle)
 		} else if err == ErrorVerticalNotFound {
-			bus.logger.Infoln(fmt.Sprintf("vertical handle %d not found", handle))
+			bus.logger.Infof("vertical handle %d not found", handle)
 		} else {
-			bus.logger.Errorln(fmt.Sprintf("vertical %d failed to detach with err %v", handle, err))
+			bus.logger.Errorf("vertical %d failed to detach with err %v", handle, err)
 		}
 	}
 }
 
-func (bus *eventBusImpl) Request(ev interface{}) Future {
-	select {
-	case <-bus.ctx.Done():
-		return &failedFuture{ErrorEventBusShutdown}
-	default:
+func (bus *eventBusImpl) Request(ev interface{}, timeoutInMillis int64) Future {
+	if bus.ctx.Err() == nil {
 		eventID := bus.eventID.Add(1)
-		f := newFuture(eventID, bus.responseTimeoutInMilliSec+(time.Now().UnixNano()/int64(1e6)))
+		timeout := time.Now().UnixNano() / int64(1e6)
+		if timeoutInMillis > 0 {
+			timeout += timeoutInMillis
+		} else {
+			timeout += bus.responseTimeoutInMilliSec
+		}
+		f := newFuture(eventID, timeout)
 		bus.eventQueue.Enqueue(&event{eventID, f, ev})
 
 		select {
-		case bus.eventNotifyChan <- struct{}{}:
+		case bus.eventNotifyChan <- PlaceHolder:
 		default:
 		}
 
 		return f
 	}
+	return &failedFuture{ErrorEventBusShutdown}
 }
 
 func (bus *eventBusImpl) Respond(ev Event, resp *EventResponse) {
 	casted := ev.(*eventImpl)
-	_ = bus.Request(&innerEventResponse{resp, casted.id, casted.to}) // no wait
+	_ = bus.Request(&innerEventResponse{resp, casted.id, casted.to}, -1) // no wait
 }
 
 func (bus *eventBusImpl) Shutdown() {
@@ -162,17 +164,15 @@ func (bus *eventBusImpl) Shutdown() {
 func (bus *eventBusImpl) loop() {
 	for {
 		if ev, ok := bus.eventQueue.Dequeue(); ok {
-			select {
-			case <-bus.ctx.Done():
+			if bus.ctx.Err() != nil {
 				bus.cleanup()
 				return // EventBus is shutting down
-			default:
-				bus.process(ev.(*event)) // process the event we got
 			}
+			bus.process(ev.(*event)) // process the event we got
 		} else { // no event available now
 			var waitTime int64 = 24 * 3600 * 1000
-			if bus.orderedTimeout.Len() != 0 {
-				waitTime = bus.orderedTimeout.Front().Value.(*futureImpl).timeout - (time.Now().UnixNano() / int64(time.Millisecond))
+			if !bus.orderedTimeout.Empty() {
+				waitTime = bus.orderedTimeout.Left().Key.(*futureImpl).timeout - (time.Now().UnixNano() / int64(time.Millisecond))
 				if waitTime < 0 {
 					waitTime = 0
 				}
@@ -193,14 +193,14 @@ func (bus *eventBusImpl) process(ev *event) {
 	switch typedEvent := ev.body.(type) {
 	case verticalAttachEvent: // vertical attaching
 		ev.future.result.PushBack(bus.attach(AsyncVerticalInterface(typedEvent)))
-		ev.future.SetComplete()
+		ev.future.setComplete()
 	case verticalDetachEvent: // vertical detaching
 		if name, err := bus.detach(VerticalHandle(typedEvent)); err == nil {
 			ev.future.result.PushBack(name)
 		} else {
 			ev.future.err = err
 		}
-		ev.future.SetComplete()
+		ev.future.setComplete()
 	case *innerEventResponse: // response mapping
 		bus.mapResponse(typedEvent)
 	default: // event dispatching
@@ -239,7 +239,7 @@ func (bus *eventBusImpl) attach(v AsyncVerticalInterface) VerticalHandle {
 	bus.handle[handle] = impl
 	for _, concern := range impl.interests {
 		if _, ok := bus.dispatch[concern]; !ok {
-			bus.dispatch[concern] = set.NewSet()
+			bus.dispatch[concern] = set.NewThreadUnsafeSet() // EventBus is lock free
 		}
 		bus.dispatch[concern].Add(handle)
 	}
@@ -261,16 +261,10 @@ func (bus *eventBusImpl) detach(handle VerticalHandle) (string, error) {
 		}
 
 		// release dependent futures
-		for eventID, handles := range bus.responseOwnerCheck {
-			if handles.Contains(handle) {
-				bus.logger.Infoln(fmt.Sprintf("detaching vertical %s, abandon response to event %d", v.Name(), eventID))
-				handles.Remove(handle)
-				f := bus.reverseLookup[eventID].Value.(*futureImpl)
-				f.result.PushBack(&EventResponse{nil, ErrorVerticalDetached})
-
-				if handles.Cardinality() == 0 { // all responses collected
-					bus.completeFuture(f)
-				}
+		resp := &EventResponse{nil, ErrorVerticalDetached}
+		for eventID, f := range bus.futureMap {
+			if bus.tryCompleteFuture(f, handle, resp) {
+				bus.logger.Infof("detaching vertical %s, abandon response to event %d", v.Name(), eventID)
 			}
 		}
 
@@ -281,71 +275,85 @@ func (bus *eventBusImpl) detach(handle VerticalHandle) (string, error) {
 }
 
 func (bus *eventBusImpl) mapResponse(response *innerEventResponse) {
+	var name string
+	if v, ok := bus.handle[response.from]; ok {
+		name = v.Name()
+	} else {
+		name = "(unknown detached vertical)"
+	}
+
 	// response mapping
-	from := bus.handle[response.from].Name()
-	if handles, ok := bus.responseOwnerCheck[response.id]; ok {
-		if handles.Contains(response.from) { // 1 vertical is allowed only 1 response to a event
-			bus.logger.Infoln(fmt.Sprintf("got response for %d from vertical %s", response.id, from))
-			handles.Remove(response.from)
-
-			f := bus.reverseLookup[response.id].Value.(*futureImpl)
-			f.result.PushBack(response.EventResponse)
-
-			if handles.Cardinality() == 0 { // all responses collected
-				bus.completeFuture(f)
-			}
+	if f, ok := bus.futureMap[response.id]; ok {
+		if bus.tryCompleteFuture(f, response.from, response.EventResponse) {
+			bus.logger.Infof("got response for %d from vertical %s", response.id, name)
 		} else {
-			bus.logger.Errorln(fmt.Sprintf("vertical %s respond more than 1 for event %d, redundant response discarded", from, response.id))
+			bus.logger.Errorf("vertical %s respond more than 1 for event %d, redundant response discarded", name, response.id)
 		}
 	} else {
-		bus.logger.Errorln(fmt.Sprintf("response for %d from vertical %s doesn't matched any event (maybe it missed the train?)", response.id, from))
+		bus.logger.Errorf("response for %d from vertical %s doesn't matched any event (maybe it missed the train?)", response.id, name)
 	}
 }
 
 func (bus *eventBusImpl) dispatchEvent(ev *event) {
 	eventType := reflect.TypeOf(ev.body)
 	if handles, ok := bus.dispatch[eventType]; ok {
-		bus.responseOwnerCheck[ev.id] = handles.Clone()
-		bus.reverseLookup[ev.id] = bus.orderedTimeout.PushBack(ev.future)
+		ev.future.verticalChecking = handles.Clone()
+		bus.futureMap[ev.id] = ev.future
+		bus.orderedTimeout.Put(ev.future, PlaceHolder)
 
 		// notice interested verticals
 		for handle := range handles.Iter() {
 			v := bus.handle[handle.(VerticalHandle)]
-			bus.logger.Infoln(fmt.Sprintf("transmit event %d to vertical %s", ev.id, v.Name()))
+			bus.logger.Infof("transmit event %d to vertical %s", ev.id, v.Name())
 			v.eventQueue.Enqueue(&eventImpl{ev, v.handle, eventType})
 
 			select {
-			case v.eventNotifyChan <- struct{}{}:
+			case v.eventNotifyChan <- PlaceHolder:
 			default:
 			}
 		}
 	} else {
-		bus.logger.Infoln(fmt.Sprintf("event %d not interested by any vertical", ev.id))
+		bus.logger.Infof("event %d not interested by any vertical", ev.id)
 		ev.future.err = ErrorEventNotInterested
-		ev.future.SetComplete()
+		ev.future.setComplete()
 	}
 }
 
-func (bus *eventBusImpl) completeFuture(f *futureImpl) {
-	bus.logger.Infoln(fmt.Sprintf("future %d fulfilled", f.eventID))
-	f.SetComplete()
+func (bus *eventBusImpl) tryCompleteFuture(f *futureImpl, from VerticalHandle, response *EventResponse) bool {
+	// response mapping
+	if f.verticalChecking.Contains(from) { // 1 vertical is allowed only 1 response to a event
+		f.verticalChecking.Remove(from)
+		f.result.PushBack(response)
 
-	delete(bus.responseOwnerCheck, f.eventID)
-	// as future is fulfilled, remove the correspond timeout from tracking list
-	if element, ok := bus.reverseLookup[f.eventID]; ok {
-		bus.orderedTimeout.Remove(element)
-		delete(bus.reverseLookup, f.eventID)
+		if f.verticalChecking.Cardinality() == 0 { // all responses collected
+			bus.completeFuture(f)
+		}
+		return true
 	}
+	return false
+}
+
+func (bus *eventBusImpl) completeFuture(f *futureImpl) {
+	bus.logger.Infof("future %d fulfilled", f.eventID)
+	f.setComplete()
+
+	// as future is fulfilled, remove the correspond timeout from tracking list
+	bus.orderedTimeout.Remove(f)
+	delete(bus.futureMap, f.eventID)
 }
 
 func (bus *eventBusImpl) timeoutFutures() {
 	// clean timeout futures
 	now := time.Now().UnixNano() / int64(1e6)
 	for {
-		if element := bus.orderedTimeout.Front(); element != nil && element.Value.(*futureImpl).timeout <= now {
+		if element := bus.orderedTimeout.Left(); element != nil {
 			// notice the future about timeout
-			f := element.Value.(*futureImpl)
-			bus.logger.Infoln(fmt.Sprintf("future of event %d timeout at %d", f.eventID, now))
+			f := element.Key.(*futureImpl)
+			if f.timeout > now {
+				break
+			}
+
+			bus.logger.Infof("future of event %d timeout at %d", f.eventID, now)
 
 			f.err = ErrorResponseTimeout
 			bus.completeFuture(f)
@@ -358,8 +366,7 @@ func (bus *eventBusImpl) timeoutFutures() {
 func (bus *eventBusImpl) cleanup() {
 	bus.logger.Infoln("EventBus exiting...")
 	// unblock all waiting futures
-	for _, element := range bus.reverseLookup {
-		future := element.Value.(*futureImpl)
+	for _, future := range bus.futureMap {
 		future.err = ErrorEventBusShutdown
 		bus.completeFuture(future)
 	}
@@ -374,7 +381,7 @@ func (bus *eventBusImpl) cleanup() {
 				// unblock incoming futures
 				f := ev.(*event).future
 				f.err = ErrorEventBusShutdown
-				f.SetComplete()
+				f.setComplete()
 			} else { // no event available now
 				select {
 				case <-bus.eventNotifyChan: // new event add to queue, continue
@@ -386,7 +393,7 @@ func (bus *eventBusImpl) cleanup() {
 	}()
 
 	bus.verticalDetachGroup.Wait()
-	exit <- struct{}{} // blocked until goroutine above exit
+	exit <- PlaceHolder // blocked until goroutine above exit
 	bus.logger.Infoln("all verticals joined, EventBus off")
 
 	// unhold all resources
@@ -394,7 +401,6 @@ func (bus *eventBusImpl) cleanup() {
 	bus.handle = nil
 	bus.eventQueue = nil
 	bus.eventNotifyChan = nil
-	bus.responseOwnerCheck = nil
 	bus.orderedTimeout = nil
-	bus.reverseLookup = nil
+	bus.futureMap = nil
 }

@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"sync"
 
+	set "github.com/deckarep/golang-set"
 	"github.com/uber-go/atomic"
 )
 
@@ -32,11 +33,12 @@ func (f *failedFuture) GetResult() (*list.List, error) {
 
 func newFuture(eventID uint64, timeout int64) *futureImpl {
 	return &futureImpl{
-		completed: atomic.NewBool(false),
-		result:    list.New(),
-		eventID:   eventID,
-		timeout:   timeout,
-		cond:      sync.NewCond(&sync.Mutex{}),
+		completed:        atomic.NewBool(false),
+		result:           list.New(),
+		eventID:          eventID,
+		verticalChecking: nil,
+		timeout:          timeout,
+		cond:             sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -45,9 +47,10 @@ type futureImpl struct {
 	result    *list.List
 	err       error
 
-	eventID uint64
-	timeout int64
-	cond    *sync.Cond
+	eventID          uint64
+	verticalChecking set.Set
+	timeout          int64
+	cond             *sync.Cond
 }
 
 func (f *futureImpl) IsCompleted() bool {
@@ -68,7 +71,8 @@ func (f *futureImpl) GetResult() (*list.List, error) {
 	return f.result, f.err
 }
 
-func (f *futureImpl) SetComplete() {
+func (f *futureImpl) setComplete() {
+	f.verticalChecking = nil
 	f.completed.Store(true)
 	f.cond.L.Lock()
 	f.cond.Broadcast()
