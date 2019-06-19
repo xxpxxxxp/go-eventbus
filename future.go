@@ -42,6 +42,10 @@ func newFuture(eventID uint64, timeout int64) *futureImpl {
 	}
 }
 
+// the future could be pass around and wait by many goroutine
+// we need to make sure the wait is correctly handled
+// if used single threaded, 1 buffered chan would be the best solution
+// while used multi threaded, chan cannot ensure everyone wake up on wait correctly
 type futureImpl struct {
 	completed *atomic.Bool
 	result    *list.List

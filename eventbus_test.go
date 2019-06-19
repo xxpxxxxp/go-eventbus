@@ -118,7 +118,7 @@ func TestEventTimeout(t *testing.T) {
 		t.Error("event with 200ms timeout should be timeout")
 	}
 
-	if rst, err := f3.GetResult(); err != nil || rst.Len() != 1 || (time.Now().Nanosecond()/1e6)-start > 460 {
+	if rst, err := f3.GetResult(); err != nil || rst.Len() != 1 || (time.Now().Nanosecond()/1e6)-start > 470 {
 		t.Error("event with 500ms should not timeout")
 	}
 
@@ -301,7 +301,7 @@ func TestChaos(t *testing.T) {
 				if id != 0 {
 					nid := rand.Intn(id) // always request lower id to avoid circle dependency
 					// either no response at all, or the #response = #handle
-					if rst, err := bus.Request(typeMapping[nid], -1).GetResult(); err != ErrorEventNotInterested && (rst != nil && rst.Len() != handles[nid].Len()) {
+					if rst, err := bus.Request(typeMapping[nid], -1).GetResult(); err != ErrorEventBusShutdown && err != ErrorEventNotInterested && (rst != nil && rst.Len() != handles[nid].Len()) {
 						t.Error("should not have dispatch error")
 					} else {
 						for e := rst.Front(); e != nil; e = e.Next() {
@@ -325,7 +325,7 @@ func TestChaos(t *testing.T) {
 		return event.GetBody(), nil
 	}
 
-	bus := NewEventBus(1000, &DoNothingLogger{})
+	bus := NewEventBus(1000, &DoNothingLogger{}) //&ConsoleLogger{log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)})
 	for i := 0; i < len(typeMapping); i++ {
 		l := list.New()
 		c := 1 + rand.Intn(5)
